@@ -15,7 +15,7 @@ from html import escape
 from random import random
 from lxml import html, etree
 from multiprocessing import Process, Queue, Value
-from urllib.parse import urljoin, urlparse, parse_qs, quote_plus
+from urllib.parse import urljoin, urlparse, parse_qs, quote_plus, unquote
 
 
 PATH = os.path.dirname(os.path.realpath(__file__))
@@ -440,18 +440,21 @@ class SafariBooks:
         self.cover = False
         self.get()
         if not self.cover:
-            self.cover = self.get_default_cover() if "cover" in self.book_info else False
-            cover_html = self.parse_html(
-                html.fromstring("<div id=\"sbo-rt-content\"><img src=\"Images/{0}\"></div>".format(self.cover)), True
-            )
+            default_cover = self.get_default_cover() if self.book_info.get("cover") else False
+            if default_cover:
+                self.cover = default_cover
+                cover_html = self.parse_html(
+                    html.fromstring("<div id=\"sbo-rt-content\"><img src=\"Images/{0}\"></div>".format(self.cover)),
+                    True
+                )
 
-            self.book_chapters = [{
-                "filename": "default_cover.xhtml",
-                "title": "Cover"
-            }] + self.book_chapters
+                self.book_chapters = [{
+                    "filename": "default_cover.xhtml",
+                    "title": "Cover"
+                }] + self.book_chapters
 
-            self.filename = self.book_chapters[0]["filename"]
-            self.save_page_html(cover_html)
+                self.filename = self.book_chapters[0]["filename"]
+                self.save_page_html(cover_html)
 
         self.css_done_queue = Queue(0) if "win" not in sys.platform else WinQueue()
         self.display.info("Downloading book CSSs... (%s files)" % len(self.css), state=True)
@@ -609,6 +612,7 @@ class SafariBooks:
             "issued": response.get("publication_date", ""),
             "web_url": SAFARI_BASE_URL + "/library/view/-/{0}/".format(self.book_id),
             "subjects": [{"name": t} for t in response.get("tags", [])],
+            "cover": response.get("cover") or "",
         }
         for key, value in result.items():
             if value is None:
@@ -618,7 +622,8 @@ class SafariBooks:
     def get_book_chapters(self):
         def normalize(c):
             ourn = c.get("ourn", "")
-            filename = ourn.split("chapter:")[-1] if "chapter:" in ourn else c.get("title", "chapter") + ".html"
+            raw_filename = ourn.split("chapter:")[-1] if "chapter:" in ourn else c.get("title", "chapter") + ".html"
+            filename = self.normalize_relative_path(raw_filename)
             assets = c.get("related_assets", {})
             stylesheets = [{"url": u} for u in assets.get("stylesheets", [])]
             images = assets.get("images", [])
@@ -693,6 +698,24 @@ class SafariBooks:
         return bool(urlparse(url).netloc)
 
     @staticmethod
+    def normalize_relative_path(path):
+        if not path:
+            return path
+
+        query_fragment = ""
+        for marker in ("#", "?"):
+            if marker in path:
+                path, query_fragment = path.split(marker, 1)
+                query_fragment = marker + query_fragment
+                break
+
+        path = unquote(path).replace("\\", "/")
+        if "/" in path:
+            path = "_".join(part for part in path.split("/") if part and part != ".")
+
+        return path + query_fragment
+
+    @staticmethod
     def is_image_link(url: str):
         return pathlib.Path(url).suffix[1:].lower() in ["jpg", "jpeg", "png", "gif"]
 
@@ -704,7 +727,7 @@ class SafariBooks:
                     image = link.split("/")[-1]
                     return "Images/" + image
 
-                return link.replace(".html", ".xhtml")
+                return self.normalize_relative_path(link).replace(".html", ".xhtml")
 
             else:
                 if self.book_id in link:
@@ -807,6 +830,11 @@ class SafariBooks:
         try:
             if first_page:
                 is_cover = self.get_cover(book_content)
+                if is_cover is None and ("cover" in self.chapter_title.lower() or "cover" in self.filename.lower()):
+                    first_image = book_content.xpath(".//img")
+                    if len(first_image):
+                        is_cover = first_image[0]
+
                 if is_cover is not None:
                     page_css = "<style>" \
                                "body{display:table;position:absolute;margin:0!important;height:100%;width:100%;}" \
@@ -1043,6 +1071,11 @@ class SafariBooks:
         subjects = "\n".join("<dc:subject>{0}</dc:subject>".format(escape(sub.get("name", "n/d")))
                              for sub in self.book_info.get("subjects", []))
 
+        cover_item = ""
+        if self.cover:
+            cover_name = self.cover.split("/")[-1]
+            cover_item = "img_" + escape("".join(cover_name.split(".")[:-1]))
+
         return self.CONTENT_OPF.format(
             (self.book_info.get("isbn",  self.book_id)),
             escape(self.book_title),
@@ -1052,7 +1085,7 @@ class SafariBooks:
             ", ".join(escape(pub.get("name", "")) for pub in self.book_info.get("publishers", [])),
             escape(self.book_info.get("rights", "")),
             self.book_info.get("issued", ""),
-            self.cover,
+            cover_item,
             "\n".join(manifest),
             "\n".join(spine),
             self.book_chapters[0]["filename"].replace(".html", ".xhtml")
@@ -1070,7 +1103,7 @@ class SafariBooks:
                  "<navLabel><text>{2}</text></navLabel>" \
                  "<content src=\"{3}\"/>".format(
                     cc["fragment"] if len(cc["fragment"]) else cc["id"], c,
-                    escape(cc["label"]), cc["href"].replace(".html", ".xhtml").split("/")[-1]
+                    escape(cc["label"]), cc["href"].replace(".html", ".xhtml")
                  )
 
             if cc["children"]:
@@ -1086,7 +1119,7 @@ class SafariBooks:
         result = []
         for item in items:
             ourn = item.get("ourn", "")
-            filename = ourn.split("chapter:")[-1] if "chapter:" in ourn else ""
+            filename = SafariBooks.normalize_relative_path(ourn.split("chapter:")[-1] if "chapter:" in ourn else "")
             fragment = item.get("fragment", "")
             result.append({
                 "depth": item.get("depth", 1),
@@ -1143,6 +1176,10 @@ class SafariBooks:
         )
 
         zip_file = os.path.join(PATH, "Books", self.book_id)
+        existing_epub = os.path.join(self.BOOK_PATH, self.book_id + ".epub")
+        if os.path.isfile(existing_epub):
+            os.remove(existing_epub)
+
         if os.path.isfile(zip_file + ".zip"):
             os.remove(zip_file + ".zip")
 
