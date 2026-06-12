@@ -20,6 +20,7 @@ from urllib.parse import urljoin, urlparse, parse_qs, quote_plus
 
 PATH = os.path.dirname(os.path.realpath(__file__))
 COOKIES_FILE = os.path.join(PATH, "cookies.json")
+ALT_COOKIES_FILE = os.path.join(PATH, "cookie.json")
 
 ORLY_BASE_HOST = "oreilly.com"  # PLEASE INSERT URL HERE
 
@@ -34,6 +35,59 @@ PROFILE_URL = SAFARI_BASE_URL + "/profile/"
 # DEBUG
 USE_PROXY = False
 PROXIES = {"https": "https://127.0.0.1:8080"}
+
+
+def get_cookies_file_path():
+    for cookies_path in (COOKIES_FILE, ALT_COOKIES_FILE):
+        if os.path.isfile(cookies_path):
+            return cookies_path
+
+    return None
+
+
+def load_cookies_file(cookies_path):
+    with open(cookies_path) as cookies_file:
+        cookies = json.load(cookies_file)
+
+    if isinstance(cookies, dict):
+        return cookies
+
+    if isinstance(cookies, list):
+        jar = requests.cookies.RequestsCookieJar()
+
+        for index, cookie in enumerate(cookies, start=1):
+            if not isinstance(cookie, dict):
+                raise ValueError("Cookie entry #%d must be an object." % index)
+
+            if "name" not in cookie or "value" not in cookie:
+                raise ValueError("Cookie entry #%d must contain `name` and `value`." % index)
+
+            kwargs = {}
+
+            if cookie.get("domain"):
+                kwargs["domain"] = cookie["domain"]
+
+            if cookie.get("path"):
+                kwargs["path"] = cookie["path"]
+
+            if "secure" in cookie:
+                kwargs["secure"] = bool(cookie["secure"])
+
+            if cookie.get("httpOnly"):
+                kwargs["rest"] = {"HttpOnly": True}
+
+            expires = cookie.get("expirationDate")
+            if expires is not None:
+                try:
+                    kwargs["expires"] = int(float(expires))
+                except (TypeError, ValueError):
+                    pass
+
+            jar.set(cookie["name"], cookie["value"], **kwargs)
+
+        return jar
+
+    raise ValueError("Unsupported cookie file format in `%s`." % os.path.basename(cookies_path))
 
 
 class Display:
@@ -324,11 +378,16 @@ class SafariBooks:
         self.jwt = {}
 
         if not args.cred:
-            if not os.path.isfile(COOKIES_FILE):
-                self.display.exit("Login: unable to find `cookies.json` file.\n"
+            cookies_path = get_cookies_file_path()
+            if cookies_path is None:
+                self.display.exit("Login: unable to find `cookies.json` or `cookie.json` file.\n"
                                   "    Please use the `--cred` or `--login` options to perform the login.")
 
-            self.session.cookies.update(json.load(open(COOKIES_FILE)))
+            try:
+                self.session.cookies.update(load_cookies_file(cookies_path))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self.display.exit("Login: unable to load cookies from `%s`.\n"
+                                  "    %s" % (os.path.basename(cookies_path), exc))
 
         else:
             self.display.info("Logging into Safari Books Online...", state=True)
